@@ -4,13 +4,59 @@ import { NextRequest, NextResponse } from 'next/server';
 // Initialize the Gemini API
 const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY!);
 
-// Define the expected response structure
-type Vaccine = { vaccine: string; date: string | null; lot_or_notes: string | null; source: string };
-type Surgery = { procedure: string; date: string | null; outcome_or_notes: string | null; source: string };
-type Medication = { drug: string; dose: string | null; frequency: string | null; start_date: string | null; end_date: string | null; source: string };
-type Bloodwork = { panel: string; date: string | null; highlights: string[]; source: string };
+// Define the response schema for structured output
+const dateExtractionSchema = {
+  type: "object",
+  properties: {
+    dates: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          date: { 
+            type: "string",
+            description: "Date in YYYY-MM-DD format"
+          },
+          category: { 
+            type: "string",
+            enum: ["vaccination", "certificate", "exam", "prescribed_medication", "preventative_treatment", "bloodwork", "surgery", "reminder"],
+            description: "Category of the veterinary event"
+          },
+          specific_type: { 
+            type: "string",
+            description: "Specific type of procedure, vaccine, or treatment"
+          },
+          source: { 
+            type: "string",
+            description: "Document identifier (e.g., Document 1, Document 2)"
+          },
+          notes: { 
+            type: "string",
+            description: "Optional additional context or notes"
+          }
+        },
+        required: ["date", "category", "specific_type", "source"]
+      }
+    }
+  },
+  required: ["dates"]
+};
 
-type Summary = {
+// Define the new date-centric response structure
+type CategorizedDate = {
+  date: string; // YYYY-MM-DD format
+  category: 'vaccination' | 'certificate' | 'exam' | 'prescribed_medication' | 'preventative_treatment' | 'bloodwork' | 'surgery' | 'reminder' | 'other';
+  specific_type: string; // e.g., "rabies", "lyme", "fecal", "DHPP/DA2P", "Bloodwork result: CBC", etc.
+  source: string; // document name
+  notes?: string; // any additional context
+};
+
+type ExtractedData = {
+  dates: CategorizedDate[];
+};
+
+// Final processed response structure (derived from dates)
+type ProcessedSummary = {
   faqs: {
     last_rabies_vaccine_date: string | null;
     last_rabies_vaccine_source: string | null;
@@ -33,11 +79,223 @@ type Summary = {
     last_lyme_date: string | null;
     last_lyme_source: string | null;
   };
-  vaccines: Vaccine[];
-  surgeries: Surgery[];
-  medications: Medication[];
-  bloodwork: Bloodwork[];
+  all_dates: CategorizedDate[];
 };
+
+// Date extraction prompt - simplified since we're using structured output
+const getDateExtractionPrompt = (fileCount: number) => {
+  const currentDate = new Date().toISOString().split('T')[0]; // YYYY-MM-DD format
+  return `You are a veterinary date extraction specialist. Your job is to find EVERY relevant date in these ${fileCount} PDF documents and categorize it accurately.
+
+CRITICAL DATE FORMAT REQUIREMENTS:
+- ONLY process dates with NUMERIC formats: MM/DD/YYYY, MM-DD-YYYY, DD/MM/YYYY, etc.
+- IGNORE dates written with full month names like "December 2024", "Spring 2023", "January 15, 2023"
+- IGNORE vague date references like "last month", "next year", "recently"
+- If a date doesn't fit the available categories, DO NOT include it
+
+CRITICAL CATEGORIZATION PRIORITY (follow this order):
+1. FIRST: Look for certificate context - "certificate issued", "certificate expires", "cert expires" → use "certificate" category
+2. SECOND: Look for reminder context - "due", "next due", "reminder", "schedule" → use "reminder" category  
+3. THIRD: DATE VALIDATION - If date is after ${currentDate}, it MUST be "reminder", NEVER "vaccination"
+4. FOURTH: Look for administration context - "last done", "given", "administered", "completed", "received" → use "vaccination" category
+5. LAST: Consider the procedure type and date timing
+
+CONTEXT OVERRIDES VACCINE TYPE:
+- "Rabies certificate issued" = "certificate" category (NOT vaccination)
+- "DHPP reminder due" = "reminder" category (NOT vaccination)  
+- "Rabies vaccine given" = "vaccination" category
+- The word appearing near the date (certificate, reminder, given) is MORE IMPORTANT than the vaccine name
+
+For each NUMERIC date you find:
+1. Convert to YYYY-MM-DD format
+2. Apply the categorization priority rules above
+3. Identify the specific type of procedure/vaccine/treatment
+4. Note which document it came from
+
+AVAILABLE CATEGORIES (if date doesn't fit these, ignore it):
+- "vaccination": Past vaccine administrations (when vaccines were actually given/administered)
+- "reminder": Future vaccine due dates or reminders
+- "certificate": Certificate issue/expiration dates (regardless of vaccine type)
+- "exam": Physical exams, wellness checks, fecal exams, heartworm tests
+- "prescribed_medication": Medication start/end dates
+- "preventative_treatment": Flea/tick prevention, heartworm prevention
+- "bloodwork": Lab work, blood panels, urinalysis
+- "surgery": Surgical procedures, dental cleanings
+
+Use "Document 1", "Document 2", etc. as source identifiers.
+Only extract dates that are clearly numeric and fit the available categories.`;
+};
+
+// Helper function to call Gemini with structured output
+async function callGeminiWithSchema(model: string, prompt: string, fileData?: { inlineData: { data: string; mimeType: string } }[], schema?: object) {
+  const generationConfig: Record<string, unknown> = {
+    temperature: 0.0,
+    maxOutputTokens: 8192,
+    topP: 0.1,
+    topK: 1,
+  };
+
+  // Add response schema if provided
+  if (schema) {
+    generationConfig.responseSchema = schema;
+    generationConfig.responseMimeType = "application/json";
+  }
+
+  const geminiModel = genAI.getGenerativeModel({ 
+    model,
+    generationConfig
+  });
+
+  const content = fileData ? [prompt, ...fileData] : [prompt];
+  const result = await geminiModel.generateContent(content);
+  const response = await result.response;
+  return response.text();
+}
+
+// Helper function to parse structured JSON response
+function parseGeminiResponse(text: string): ExtractedData {
+  try {
+    // With structured output, the response should already be valid JSON
+    return JSON.parse(text) as ExtractedData;
+  } catch (error) {
+    console.error('JSON parsing failed with structured output:', error);
+    console.error('Response text:', text);
+    throw new Error(`Structured output parsing failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  }
+}
+
+// Function to derive FAQ answers from categorized dates
+function deriveFAQsFromDates(dates: CategorizedDate[]): ProcessedSummary['faqs'] {
+  const faqs: ProcessedSummary['faqs'] = {
+    last_rabies_vaccine_date: null,
+    last_rabies_vaccine_source: null,
+    last_fecal_exam_date: null,
+    last_fecal_exam_source: null,
+    last_heartworm_exam_or_treatment_date: null,
+    last_heartworm_exam_or_treatment_source: null,
+    last_wellness_screen_date: null,
+    last_wellness_screen_source: null,
+    last_dental_date: null,
+    last_dental_source: null,
+    last_dhpp_date: null,
+    last_dhpp_source: null,
+    last_lepto_date: null,
+    last_lepto_source: null,
+    last_influenza_date: null,
+    last_influenza_source: null,
+    last_flea_tick_prevention_date: null,
+    last_flea_tick_prevention_source: null,
+    last_lyme_date: null,
+    last_lyme_source: null,
+  };
+
+  // Helper function to find the most recent date for a specific type
+  const findMostRecent = (filterFn: (date: CategorizedDate) => boolean) => {
+    const filtered = dates.filter(filterFn).sort((a, b) => b.date.localeCompare(a.date));
+    return filtered.length > 0 ? filtered[0] : null;
+  };
+
+  // Rabies vaccine - ONLY vaccination category
+  const rabiesVaccine = findMostRecent(d => 
+    d.category === 'vaccination' && d.specific_type.toLowerCase().includes('rabies')
+  );
+  if (rabiesVaccine) {
+    faqs.last_rabies_vaccine_date = rabiesVaccine.date;
+    faqs.last_rabies_vaccine_source = rabiesVaccine.source;
+  }
+
+  // Fecal exam - ONLY exam category
+  const fecalExam = findMostRecent(d => 
+    d.category === 'exam' && d.specific_type.toLowerCase().includes('fecal')
+  );
+  if (fecalExam) {
+    faqs.last_fecal_exam_date = fecalExam.date;
+    faqs.last_fecal_exam_source = fecalExam.source;
+  }
+
+  // Heartworm exam or treatment - ONLY exam/preventative_treatment categories
+  const heartworm = findMostRecent(d => 
+    (d.category === 'exam' || d.category === 'preventative_treatment') && 
+    d.specific_type.toLowerCase().includes('heartworm')
+  );
+  if (heartworm) {
+    faqs.last_heartworm_exam_or_treatment_date = heartworm.date;
+    faqs.last_heartworm_exam_or_treatment_source = heartworm.source;
+  }
+
+  // Wellness/physical exam - ONLY exam category
+  const wellness = findMostRecent(d => 
+    d.category === 'exam' && (
+      d.specific_type.toLowerCase().includes('wellness') || 
+      d.specific_type.toLowerCase().includes('physical')
+    )
+  );
+  if (wellness) {
+    faqs.last_wellness_screen_date = wellness.date;
+    faqs.last_wellness_screen_source = wellness.source;
+  }
+
+  // Dental - ONLY exam/surgery categories
+  const dental = findMostRecent(d => 
+    (d.category === 'exam' || d.category === 'surgery') && 
+    d.specific_type.toLowerCase().includes('dental')
+  );
+  if (dental) {
+    faqs.last_dental_date = dental.date;
+    faqs.last_dental_source = dental.source;
+  }
+
+  // DHPP/DA2P vaccine - ONLY vaccination category
+  const dhpp = findMostRecent(d => 
+    d.category === 'vaccination' && (
+      d.specific_type.toLowerCase().includes('dhpp') || 
+      d.specific_type.toLowerCase().includes('da2p')
+    )
+  );
+  if (dhpp) {
+    faqs.last_dhpp_date = dhpp.date;
+    faqs.last_dhpp_source = dhpp.source;
+  }
+
+  // Leptospirosis vaccine - ONLY vaccination category
+  const lepto = findMostRecent(d => 
+    d.category === 'vaccination' && d.specific_type.toLowerCase().includes('lepto')
+  );
+  if (lepto) {
+    faqs.last_lepto_date = lepto.date;
+    faqs.last_lepto_source = lepto.source;
+  }
+
+  // Influenza vaccine - ONLY vaccination category
+  const influenza = findMostRecent(d => 
+    d.category === 'vaccination' && d.specific_type.toLowerCase().includes('influenza')
+  );
+  if (influenza) {
+    faqs.last_influenza_date = influenza.date;
+    faqs.last_influenza_source = influenza.source;
+  }
+
+  // Flea/tick prevention - ONLY preventative_treatment category
+  const fleaTick = findMostRecent(d => 
+    d.category === 'preventative_treatment' && 
+    (d.specific_type.toLowerCase().includes('flea') || d.specific_type.toLowerCase().includes('tick'))
+  );
+  if (fleaTick) {
+    faqs.last_flea_tick_prevention_date = fleaTick.date;
+    faqs.last_flea_tick_prevention_source = fleaTick.source;
+  }
+
+  // Lyme vaccine - ONLY vaccination category
+  const lyme = findMostRecent(d => 
+    d.category === 'vaccination' && d.specific_type.toLowerCase().includes('lyme')
+  );
+  if (lyme) {
+    faqs.last_lyme_date = lyme.date;
+    faqs.last_lyme_source = lyme.source;
+  }
+
+  return faqs;
+}
 
 export async function POST(request: NextRequest) {
   try {
@@ -59,13 +317,13 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    console.log(`Processing ${files.length} PDF files...`);
+    console.log(`Processing ${files.length} PDF files for date extraction...`);
 
     // Calculate total file size for debugging
     const totalSize = files.reduce((sum, file) => sum + file.size, 0);
     console.log(`Total file size: ${(totalSize / 1024 / 1024).toFixed(2)} MB`);
 
-    // Convert files to base64 for Gemini API - Gemini 1.5 Pro can handle large contexts
+    // Convert files to base64 for Gemini API
     const fileData = await Promise.all(
       files.map(async (file, index) => {
         const bytes = await file.arrayBuffer();
@@ -80,153 +338,56 @@ export async function POST(request: NextRequest) {
       })
     );
 
-    // Try with Gemini 1.5 Pro first (best for large contexts)
-    let model = genAI.getGenerativeModel({ 
-      model: 'gemini-1.5-pro-latest',
-      generationConfig: {
-        temperature: 0.1,
-        maxOutputTokens: 8192,
-      }
-    });
-
-    const prompt = `Please analyze these veterinary PDF records and extract the following information in JSON format:
-
-{
-  "faqs": {
-    "last_rabies_vaccine_date": "YYYY-MM-DD or null",
-    "last_rabies_vaccine_source": "document name or null",
-    "last_fecal_exam_date": "YYYY-MM-DD or null", 
-    "last_fecal_exam_source": "document name or null",
-    "last_heartworm_exam_or_treatment_date": "YYYY-MM-DD or null",
-    "last_heartworm_exam_or_treatment_source": "document name or null",
-    "last_wellness_screen_date": "YYYY-MM-DD or null",
-    "last_wellness_screen_source": "document name or null",
-    "last_dental_date": "YYYY-MM-DD or null",
-    "last_dental_source": "document name or null",
-    "last_dhpp_date": "YYYY-MM-DD or null",
-    "last_dhpp_source": "document name or null",
-    "last_lepto_date": "YYYY-MM-DD or null",
-    "last_lepto_source": "document name or null",
-    "last_influenza_date": "YYYY-MM-DD or null",
-    "last_influenza_source": "document name or null",
-    "last_flea_tick_prevention_date": "YYYY-MM-DD or null",
-    "last_flea_tick_prevention_source": "document name or null",
-    "last_lyme_date": "YYYY-MM-DD or null",
-    "last_lyme_source": "document name or null"
-  },
-  "vaccines": [
-    {
-      "vaccine": "vaccine name",
-      "date": "YYYY-MM-DD or null",
-      "lot_or_notes": "lot number or notes or null",
-      "source": "document name"
-    }
-  ],
-  "surgeries": [
-    {
-      "procedure": "procedure name",
-      "date": "YYYY-MM-DD or null",
-      "outcome_or_notes": "outcome or notes or null",
-      "source": "document name"
-    }
-  ],
-  "medications": [
-    {
-      "drug": "medication name",
-      "dose": "dosage or null",
-      "frequency": "frequency or null",
-      "start_date": "YYYY-MM-DD or null",
-      "end_date": "YYYY-MM-DD or null",
-      "source": "document name"
-    }
-  ],
-  "bloodwork": [
-    {
-      "panel": "panel name",
-      "date": "YYYY-MM-DD or null",
-      "highlights": ["highlight1", "highlight2"],
-      "source": "document name"
-    }
-  ]
-}
-
-Instructions:
-- Use OCR to read all text from the PDF documents
-- Extract ALL veterinary information including vaccines, medications, procedures, lab work
-- For the "faqs" section, find the MOST RECENT date for each category across all documents
-- Use "Document 1", "Document 2", etc. as the "source" identifiers
-- Convert all dates to YYYY-MM-DD format (e.g., "12/15/2023" becomes "2023-12-15")
-- If a date cannot be determined, use null
-- Include all relevant medical information found in the documents
-- Return ONLY valid JSON, no additional text or formatting
-- Do not include markdown code blocks in your response
-
-Analyzing ${files.length} PDF document(s).`;
-
-    console.log('Attempting to generate content with Gemini 1.5 Pro...');
-
-    let result;
-    const modelFallbacks = [
-      'gemini-1.5-flash',     // Start with Flash - it's fast and supports PDFs
-      'gemini-1.5-pro',       // Then Pro for better quality
-      'gemini-1.5-flash-latest',
-      'gemini-1.5-pro-latest'
-    ];
-
+    // Extract dates using Gemini
+    console.log('Extracting and categorizing all dates...');
+    const extractionPrompt = getDateExtractionPrompt(files.length);
+    
+    let extractedData: ExtractedData;
+    // Try most reliable models first to minimize failures
+    const models = ['gemini-1.5-pro-latest', 'gemini-1.5-pro', 'gemini-1.5-flash-latest', 'gemini-1.5-flash'];
+    
     let lastError;
-    for (const modelName of modelFallbacks) {
+    let extractionSuccess = false;
+    
+    for (const modelName of models) {
       try {
-        console.log(`Trying model: ${modelName}`);
-        model = genAI.getGenerativeModel({ 
-          model: modelName,
-          generationConfig: {
-            temperature: 0.1,
-            maxOutputTokens: 8192,
-          }
-        });
+        console.log(`Trying date extraction with: ${modelName}`);
+        const text = await callGeminiWithSchema(modelName, extractionPrompt, fileData, dateExtractionSchema);
+        extractedData = parseGeminiResponse(text);
         
-        result = await model.generateContent([prompt, ...fileData]);
-        console.log(`Success with model: ${modelName}`);
+        // Validate the structure
+        if (!extractedData || !extractedData.dates || !Array.isArray(extractedData.dates)) {
+          throw new Error('Invalid response structure: missing dates array');
+        }
+        
+        console.log(`Date extraction successful with: ${modelName}`);
+        console.log(`Extracted ${extractedData.dates.length} dates`);
+        extractionSuccess = true;
         break;
       } catch (error: unknown) {
         const errorMessage = error instanceof Error ? error.message : 'Unknown error';
         console.error(`Model ${modelName} failed:`, errorMessage);
         lastError = error;
-        
-        // If it's not a rate limit error, don't try other models
-        if (!errorMessage.includes('RATE_LIMIT_EXCEEDED') && !errorMessage.includes('429')) {
-          console.log('Non-rate-limit error, stopping fallback attempts');
-          break;
-        }
         continue;
       }
     }
 
-    if (!result) {
-      console.error('All models failed, throwing last error');
+    if (!extractionSuccess) {
+      console.error('All models failed for date extraction');
       throw lastError;
     }
 
-    const response = await result.response;
-    const text = response.text();
-
-    console.log('Content generated successfully');
-
-    // Parse the JSON response
-    let parsedData: Summary;
-    try {
-      // Clean up the response text (remove markdown formatting if present)
-      const cleanText = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-      parsedData = JSON.parse(cleanText);
-    } catch {
-      console.error('Failed to parse Gemini response:', text);
-      return NextResponse.json(
-        { error: 'Failed to parse AI response', details: text },
-        { status: 500 }
-      );
-    }
-
-    return NextResponse.json(parsedData);
+    // Process the extracted dates to derive FAQ answers
+    console.log('Deriving FAQ answers from extracted dates...');
+    const faqs = deriveFAQsFromDates(extractedData!.dates);
+    
+    const finalData: ProcessedSummary = {
+      faqs,
+      all_dates: extractedData!.dates
+    };
+    
+    console.log('Processing completed successfully');
+    return NextResponse.json(finalData);
 
   } catch (error: unknown) {
     console.error('Error processing files:', error);

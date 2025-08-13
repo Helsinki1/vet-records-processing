@@ -2,10 +2,14 @@
 
 import { useState, useCallback } from "react";
 
-type Vaccine = { vaccine: string; date: string | null; lot_or_notes: string | null; source: string };
-type Surgery = { procedure: string; date: string | null; outcome_or_notes: string | null; source: string };
-type Medication = { drug: string; dose: string | null; frequency: string | null; start_date: string | null; end_date: string | null; source: string };
-type Bloodwork = { panel: string; date: string | null; highlights: string[]; source: string };
+// New date-centric types to match the API
+type CategorizedDate = {
+  date: string; // YYYY-MM-DD format
+  category: 'vaccination' | 'certificate' | 'exam' | 'prescribed_medication' | 'preventative_treatment' | 'bloodwork' | 'surgery' | 'other';
+  specific_type: string; // e.g., "rabies", "lyme", "fecal", "DHPP/DA2P", "Bloodwork result: CBC", etc.
+  source: string; // document name
+  notes?: string; // any additional context
+};
 
 type Summary = {
   faqs: {
@@ -30,10 +34,7 @@ type Summary = {
     last_lyme_date: string | null;
     last_lyme_source: string | null;
   };
-  vaccines: Vaccine[];
-  surgeries: Surgery[];
-  medications: Medication[];
-  bloodwork: Bloodwork[];
+  all_dates: CategorizedDate[];
 };
 
 // Fixed function to merge files without DataTransfer issues
@@ -52,6 +53,36 @@ function mergeFiles(existing: File[], incoming: FileList): File[] {
   }
   
   return existingFiles;
+}
+
+// Helper function to get category display name
+function getCategoryDisplayName(category: string): string {
+  switch (category) {
+    case 'vaccination': return '💉 Vaccination';
+    case 'certificate': return '📜 Certificate';
+    case 'exam': return '🔍 Examination';
+    case 'prescribed_medication': return '💊 Prescribed Medication';
+    case 'preventative_treatment': return '🛡️ Preventative Treatment';
+    case 'bloodwork': return '🩸 Bloodwork';
+    case 'surgery': return '🏥 Surgery';
+    case 'other': return '📋 Other';
+    default: return '📋 Unknown';
+  }
+}
+
+// Helper function to get category color
+function getCategoryColor(category: string): string {
+  switch (category) {
+    case 'vaccination': return 'bg-green-50 border-green-200 text-green-800';
+    case 'certificate': return 'bg-purple-50 border-purple-200 text-purple-800';
+    case 'exam': return 'bg-blue-50 border-blue-200 text-blue-800';
+    case 'prescribed_medication': return 'bg-orange-50 border-orange-200 text-orange-800';
+    case 'preventative_treatment': return 'bg-teal-50 border-teal-200 text-teal-800';
+    case 'bloodwork': return 'bg-red-50 border-red-200 text-red-800';
+    case 'surgery': return 'bg-indigo-50 border-indigo-200 text-indigo-800';
+    case 'other': return 'bg-gray-50 border-gray-200 text-gray-800';
+    default: return 'bg-gray-50 border-gray-200 text-gray-800';
+  }
 }
 
 export default function Home() {
@@ -129,13 +160,13 @@ export default function Home() {
     }
     
     setLoading(true);
-    setProcessingStatus("Starting OCR processing...");
+    setProcessingStatus("Starting date extraction...");
     
     try {
       const form = new FormData();
       files.forEach((f) => form.append("files", f));
       
-      setProcessingStatus("Processing...");
+      setProcessingStatus("Extracting and categorizing dates...");
       
       const res = await fetch("/api/ingest", { 
         method: "POST", 
@@ -150,7 +181,7 @@ export default function Home() {
         throw new Error(err.error || `Request failed: ${res.status}. ${err.details || ''}`);
       }
       
-      setProcessingStatus("Generating structured summary...");
+      setProcessingStatus("Generating summary from dates...");
       const json = (await res.json()) as Summary;
       
       setProcessingStatus("Complete!");
@@ -182,8 +213,8 @@ export default function Home() {
     <div className="min-h-screen bg-white text-gray-900">
       <div className="max-w-6xl mx-auto p-6 space-y-6">
         <header className="flex items-center justify-between">
-          <h1 className="text-xl font-semibold">Vet Records Summarizer</h1>
-          <div className="text-sm text-gray-500">OCR-powered PDF processing</div>
+          <h1 className="text-xl font-semibold">Vet Records Extractor</h1>
+          <div className="text-sm text-gray-500">Date-focused PDF processing</div>
         </header>
 
         <section className="bg-gray-50 border rounded-lg p-4">
@@ -296,7 +327,7 @@ export default function Home() {
         {data && (
           <div className="space-y-6">
             <section>
-              <h2 className="text-lg font-semibold mb-3">Overview</h2>
+              <h2 className="text-lg font-semibold mb-3">Quick Reference (FAQ)</h2>
               <div className="border border-gray-200 rounded-lg p-6 bg-white shadow-sm">
                 <div className="grid gap-4 md:grid-cols-2">
                   <div className="space-y-3">
@@ -328,7 +359,7 @@ export default function Home() {
                       </div>
                     </div>
                     <div className="flex justify-between items-start">
-                      <span className="font-medium text-gray-900">Last Wellness screen:</span>
+                      <span className="font-medium text-gray-900">Last wellness / physical:</span>
                       <div className="text-right">
                         <div className="text-sm text-gray-700">{data.faqs.last_wellness_screen_date || "Not specified"}</div>
                         {data.faqs.last_wellness_screen_source && (
@@ -348,7 +379,7 @@ export default function Home() {
                   </div>
                   <div className="space-y-3">
                     <div className="flex justify-between items-start">
-                      <span className="font-medium text-gray-900">Last DHPP vaccine:</span>
+                      <span className="font-medium text-gray-900">Last DHPP/DA2P vaccine:</span>
                       <div className="text-right">
                         <div className="text-sm text-gray-700">{data.faqs.last_dhpp_date || "Not specified"}</div>
                         {data.faqs.last_dhpp_source && (
@@ -398,96 +429,45 @@ export default function Home() {
             </section>
 
             <section>
-              <h2 className="text-lg font-semibold mb-3">Vaccines</h2>
-              <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {data.vaccines.map((v, idx) => (
-                  <div key={idx} className="border border-gray-200 rounded-lg p-4 bg-white text-sm shadow-sm hover:shadow-md transition-shadow">
-                    <div className="flex items-start justify-between mb-2">
-                      <div className="font-semibold text-gray-900">{v.vaccine}</div>
-                      <div className="text-xs text-gray-500 bg-gray-50 px-2 py-1 rounded">{v.source}</div>
+              <h2 className="text-lg font-semibold mb-3">All Extracted Dates ({data.all_dates.length} total)</h2>
+              <div className="space-y-4">
+                {/* Group dates by category */}
+                {['vaccination', 'exam', 'preventative_treatment', 'bloodwork', 'surgery', 'prescribed_medication', 'certificate', 'other'].map(category => {
+                  const categoryDates = data.all_dates
+                    .filter(d => d.category === category)
+                    .sort((a, b) => b.date.localeCompare(a.date)); // Most recent first
+                  
+                  if (categoryDates.length === 0) return null;
+                  
+                  return (
+                    <div key={category} className="border border-gray-200 rounded-lg bg-white shadow-sm">
+                      <div className={`px-4 py-3 border-b border-gray-200 ${getCategoryColor(category)} rounded-t-lg`}>
+                        <h3 className="font-medium">{getCategoryDisplayName(category)} ({categoryDates.length})</h3>
+                      </div>
+                      <div className="p-4">
+                        <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-3">
+                          {categoryDates.map((dateItem, idx) => (
+                            <div key={idx} className="border border-gray-100 rounded p-3 bg-gray-50">
+                              <div className="flex justify-between items-start mb-2">
+                                <div className="font-medium text-gray-900 capitalize">{dateItem.specific_type}</div>
+                                <div className="text-xs text-gray-500 bg-white px-2 py-1 rounded">{dateItem.source}</div>
+                              </div>
+                              <div className="text-sm text-gray-700 font-mono">{dateItem.date}</div>
+                              {dateItem.notes && (
+                                <div className="text-xs text-gray-600 mt-1 italic">{dateItem.notes}</div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
                     </div>
-                    <div className="text-sm text-gray-700 mb-1">{v.date || "Date not specified"}</div>
-                    {v.lot_or_notes && <div className="text-xs text-gray-500 italic">{v.lot_or_notes}</div>}
-                  </div>
-                ))}
+                  );
+                })}
+                
+                {data.all_dates.length === 0 && (
+                  <div className="text-center py-8 text-gray-500">No dates found in the documents</div>
+                )}
               </div>
-              {data.vaccines.length === 0 && (
-                <div className="text-center py-8 text-gray-500">No vaccine records found</div>
-              )}
-            </section>
-
-            <section>
-              <h2 className="text-lg font-semibold mb-3">Surgeries & Procedures</h2>
-              <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {data.surgeries.map((s, idx) => (
-                  <div key={idx} className="border border-gray-200 rounded-lg p-4 bg-white text-sm shadow-sm hover:shadow-md transition-shadow">
-                    <div className="flex items-start justify-between mb-2">
-                      <div className="font-semibold text-gray-900">{s.procedure}</div>
-                      <div className="text-xs text-gray-500 bg-gray-50 px-2 py-1 rounded">{s.source}</div>
-                    </div>
-                    <div className="text-sm text-gray-700 mb-1">{s.date || "Date not specified"}</div>
-                    {s.outcome_or_notes && <div className="text-xs text-gray-500 italic">{s.outcome_or_notes}</div>}
-                  </div>
-                ))}
-              </div>
-              {data.surgeries.length === 0 && (
-                <div className="text-center py-8 text-gray-500">No surgical procedures found</div>
-              )}
-            </section>
-
-            <section>
-              <h2 className="text-lg font-semibold mb-3">Medications</h2>
-              <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {data.medications.map((m, idx) => (
-                  <div key={idx} className="border border-gray-200 rounded-lg p-4 bg-white text-sm shadow-sm hover:shadow-md transition-shadow">
-                    <div className="flex items-start justify-between mb-2">
-                      <div className="font-semibold text-gray-900">{m.drug}</div>
-                      <div className="text-xs text-gray-500 bg-gray-50 px-2 py-1 rounded">{m.source}</div>
-                    </div>
-                    <div className="text-sm text-gray-700 mb-1">
-                      {m.dose || "Dose not specified"} {m.frequency ? `• ${m.frequency}` : ""}
-                    </div>
-                    <div className="text-xs text-gray-500">
-                      {m.start_date || "Start date not specified"}
-                      {m.end_date ? ` → ${m.end_date}` : ""}
-                    </div>
-                  </div>
-                ))}
-              </div>
-              {data.medications.length === 0 && (
-                <div className="text-center py-8 text-gray-500">No medication records found</div>
-              )}
-            </section>
-
-            <section>
-              <h2 className="text-lg font-semibold mb-3">Bloodwork & Lab Results</h2>
-              <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {data.bloodwork.map((b, idx) => (
-                  <div key={idx} className="border border-gray-200 rounded-lg p-4 bg-white text-sm shadow-sm hover:shadow-md transition-shadow">
-                    <div className="flex items-start justify-between mb-2">
-                      <div className="font-semibold text-gray-900">{b.panel}</div>
-                      <div className="text-xs text-gray-500 bg-gray-50 px-2 py-1 rounded">{b.source}</div>
-                    </div>
-                    <div className="text-sm text-gray-700 mb-2">{b.date || "Date not specified"}</div>
-                    {b.highlights?.length > 0 && (
-                      <ul className="text-xs text-gray-600 space-y-1">
-                        {b.highlights.map((h, i) => (
-                          <li key={i} className="flex items-start">
-                            <span className="text-blue-500 mr-1">•</span>
-                            <span>{h}</span>
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                    {(!b.highlights || b.highlights.length === 0) && (
-                      <div className="text-xs text-gray-500 italic">No specific highlights noted</div>
-                    )}
-                  </div>
-                ))}
-              </div>
-              {data.bloodwork.length === 0 && (
-                <div className="text-center py-8 text-gray-500">No bloodwork records found</div>
-              )}
             </section>
           </div>
         )}
