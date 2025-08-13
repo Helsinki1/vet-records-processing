@@ -110,7 +110,7 @@ For each NUMERIC date you find:
 1. Convert to YYYY-MM-DD format
 2. Apply the categorization priority rules above
 3. Identify the specific type of procedure/vaccine/treatment
-4. Note which document it came from
+4. Note which DOCUMENT (not page) it came from - use the file upload order
 
 AVAILABLE CATEGORIES (if date doesn't fit these, ignore it):
 - "vaccination": Past vaccine administrations (when vaccines were actually given/administered)
@@ -122,7 +122,6 @@ AVAILABLE CATEGORIES (if date doesn't fit these, ignore it):
 - "bloodwork": Lab work, blood panels, urinalysis
 - "surgery": Surgical procedures, dental cleanings
 
-Use "Document 1", "Document 2", etc. as source identifiers.
 Only extract dates that are clearly numeric and fit the available categories.`;
 };
 
