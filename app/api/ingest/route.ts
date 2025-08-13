@@ -163,6 +163,30 @@ function parseGeminiResponse(text: string): ExtractedData {
   }
 }
 
+// Function to validate and clean dates - ensures no future dates in vaccination category
+function validateAndCleanDates(dates: CategorizedDate[]): CategorizedDate[] {
+  const currentDate = new Date().toISOString().split('T')[0]; // YYYY-MM-DD format
+  
+  return dates.map(date => {
+    // If it's a vaccination category and the date is in the future, change it to reminder
+    if (date.category === 'vaccination' && date.date > currentDate) {
+      console.warn(`Converting future vaccination date to reminder: ${date.date} for ${date.specific_type}`);
+      return {
+        ...date,
+        category: 'reminder' as const
+      };
+    }
+    return date;
+  }).filter(date => {
+    // Additional safety check - remove any vaccination dates that are still in the future
+    if (date.category === 'vaccination' && date.date > currentDate) {
+      console.warn(`Removing invalid future vaccination date: ${date.date} for ${date.specific_type}`);
+      return false;
+    }
+    return true;
+  });
+}
+
 // Function to derive FAQ answers from categorized dates
 function deriveFAQsFromDates(dates: CategorizedDate[]): ProcessedSummary['faqs'] {
   const faqs: ProcessedSummary['faqs'] = {
@@ -376,13 +400,18 @@ export async function POST(request: NextRequest) {
       throw lastError;
     }
 
-    // Process the extracted dates to derive FAQ answers
-    console.log('Deriving FAQ answers from extracted dates...');
-    const faqs = deriveFAQsFromDates(extractedData!.dates);
+    // Validate and clean the extracted dates - ensure no future dates in vaccination category
+    console.log('Validating and cleaning extracted dates...');
+    const cleanedDates = validateAndCleanDates(extractedData!.dates);
+    console.log(`After validation: ${cleanedDates.length} dates (${extractedData!.dates.length - cleanedDates.length} removed/modified)`);
+    
+    // Process the cleaned dates to derive FAQ answers
+    console.log('Deriving FAQ answers from cleaned dates...');
+    const faqs = deriveFAQsFromDates(cleanedDates);
     
     const finalData: ProcessedSummary = {
       faqs,
-      all_dates: extractedData!.dates
+      all_dates: cleanedDates
     };
     
     console.log('Processing completed successfully');
