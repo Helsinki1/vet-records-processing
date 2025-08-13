@@ -59,42 +59,118 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [data, setData] = useState<Summary | null>(null);
+  const [isDragOver, setIsDragOver] = useState(false);
+  const [processingStatus, setProcessingStatus] = useState<string>("");
+
+  const onDragEnter = useCallback((e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(true);
+  }, []);
+
+  const onDragLeave = useCallback((e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    // Only set isDragOver to false if we're leaving the drop zone entirely
+    if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+      setIsDragOver(false);
+    }
+  }, []);
 
   const onDrop = useCallback((e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     e.stopPropagation();
+    setIsDragOver(false);
+    
     const dt = e.dataTransfer;
     if (!dt?.files?.length) return;
-    setFiles((prev) => mergeFiles(prev, dt.files));
+    
+    // Filter for PDF files only
+    const pdfFiles = Array.from(dt.files).filter(file => 
+      file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')
+    );
+    
+    if (pdfFiles.length === 0) {
+      setError("Please drop only PDF files");
+      return;
+    }
+    
+    // Create a FileList-like object from the filtered PDF files
+    const fileList = {
+      length: pdfFiles.length,
+      item: (index: number) => pdfFiles[index] || null,
+      [Symbol.iterator]: function* () {
+        for (let i = 0; i < pdfFiles.length; i++) {
+          yield pdfFiles[i];
+        }
+      }
+    } as FileList;
+    
+    setFiles((prev) => mergeFiles(prev, fileList));
+    setError(null);
   }, []);
 
   const onDragOver = useCallback((e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     e.stopPropagation();
+    // Set the dropEffect to show the user that dropping is allowed
+    e.dataTransfer.dropEffect = 'copy';
   }, []);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
     setData(null);
+    setProcessingStatus("");
+    
     if (!files || files.length === 0) {
       setError("Please select one or more PDFs");
       return;
     }
+    
     setLoading(true);
+    setProcessingStatus("Starting OCR processing...");
+    
     try {
       const form = new FormData();
       files.forEach((f) => form.append("files", f));
-      const res = await fetch("/api/ingest", { method: "POST", body: form });
+      
+      setProcessingStatus("Processing...");
+      
+      const res = await fetch("/api/ingest", { 
+        method: "POST", 
+        body: form,
+        // Add a longer timeout for the fetch request
+        signal: AbortSignal.timeout(300000) // 5 minutes
+      });
+      
       if (!res.ok) {
-        const err = await res.json().catch(() => ({} as { error?: string }));
-        throw new Error(err.error || `Request failed: ${res.status}`);
+        const err = await res.json().catch(() => ({} as { error?: string, details?: string }));
+        console.error("API Error:", err);
+        throw new Error(err.error || `Request failed: ${res.status}. ${err.details || ''}`);
       }
+      
+      setProcessingStatus("Generating structured summary...");
       const json = (await res.json()) as Summary;
+      
+      setProcessingStatus("Complete!");
       setData(json);
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : "Something went wrong";
+      console.error("Request error:", err);
+      let message = "Something went wrong";
+      
+      if (err instanceof Error) {
+        if (err.name === 'TimeoutError') {
+          message = "Processing timed out. This can happen with large PDFs. Try processing fewer pages or smaller files.";
+        } else if (err.message.includes('fetch')) {
+          message = `Network error: ${err.message}`;
+        } else {
+          message = err.message;
+        }
+      }
+      
       setError(message);
+      setProcessingStatus("");
     } finally {
       setLoading(false);
     }
@@ -107,7 +183,7 @@ export default function Home() {
       <div className="max-w-6xl mx-auto p-6 space-y-6">
         <header className="flex items-center justify-between">
           <h1 className="text-xl font-semibold">Vet Records Summarizer</h1>
-          <div className="text-sm text-gray-500">Single-page prototype</div>
+          <div className="text-sm text-gray-500">OCR-powered PDF processing</div>
         </header>
 
         <section className="bg-gray-50 border rounded-lg p-4">
@@ -115,11 +191,27 @@ export default function Home() {
             <div
               onDrop={onDrop}
               onDragOver={onDragOver}
-              className="flex flex-col items-center justify-center gap-2 border-2 border-dashed rounded-md p-6 bg-white text-center"
+              onDragEnter={onDragEnter}
+              onDragLeave={onDragLeave}
+              className={`flex flex-col items-center justify-center gap-2 border-2 border-dashed rounded-md p-6 text-center transition-all duration-200 ${
+                isDragOver 
+                  ? 'border-blue-500 bg-blue-50 border-solid' 
+                  : 'border-gray-300 bg-white hover:border-gray-400'
+              }`}
             >
-              <p className="text-sm text-gray-700">Drag and drop PDFs here</p>
-              <p className="text-xs text-gray-500">or</p>
-              <label className="inline-block">
+              {isDragOver ? (
+                <>
+                  <div className="text-blue-600 text-lg">📁</div>
+                  <p className="text-sm text-blue-700 font-medium">Drop PDF files here</p>
+                </>
+              ) : (
+                <>
+                  <div className="text-gray-400 text-lg">📄</div>
+                  <p className="text-sm text-gray-700">Drag and drop PDF files here</p>
+                  <p className="text-xs text-gray-500">or click to browse</p>
+                </>
+              )}
+              <label className="inline-block cursor-pointer">
                 <span className="sr-only">Choose PDF files</span>
                 <input
                   type="file"
@@ -128,8 +220,13 @@ export default function Home() {
                   onChange={(e) => {
                     if (e.target.files) setFiles((prev) => mergeFiles(prev, e.target.files!));
                   }}
-                  className="block w-full text-sm text-gray-700 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-semibold file:bg-gray-200 file:text-gray-700 hover:file:bg-gray-300"
+                  className="hidden"
                 />
+                {!isDragOver && (
+                  <span className="inline-flex items-center justify-center rounded-md bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-2 text-xs font-medium transition-colors">
+                    Browse Files
+                  </span>
+                )}
               </label>
               {fileCount > 0 && (
                 <div className="text-xs text-gray-600 mt-2 max-w-full">
@@ -179,13 +276,27 @@ export default function Home() {
               </button>
             </div>
           </form>
-          {error && <p className="mt-3 text-sm text-red-600">{error}</p>}
+          
+          {loading && processingStatus && (
+            <div className="mt-3 p-3 bg-blue-50 border border-blue-200 rounded-md">
+              <div className="flex items-center gap-2">
+                <div className="animate-spin h-4 w-4 border-2 border-blue-500 border-t-transparent rounded-full"></div>
+                <span className="text-sm text-blue-700">{processingStatus}</span>
+              </div>
+            </div>
+          )}
+          
+          {error && (
+            <div className="mt-3 p-3 bg-red-50 border border-red-200 rounded-md">
+              <p className="text-sm text-red-600">{error}</p>
+            </div>
+          )}
         </section>
 
         {data && (
           <div className="space-y-6">
             <section>
-              <h2 className="text-lg font-semibold mb-3">Frequently Asked Questions</h2>
+              <h2 className="text-lg font-semibold mb-3">Overview</h2>
               <div className="border border-gray-200 rounded-lg p-6 bg-white shadow-sm">
                 <div className="grid gap-4 md:grid-cols-2">
                   <div className="space-y-3">
@@ -217,7 +328,7 @@ export default function Home() {
                       </div>
                     </div>
                     <div className="flex justify-between items-start">
-                      <span className="font-medium text-gray-900">Wellness screen:</span>
+                      <span className="font-medium text-gray-900">Last Wellness screen:</span>
                       <div className="text-right">
                         <div className="text-sm text-gray-700">{data.faqs.last_wellness_screen_date || "Not specified"}</div>
                         {data.faqs.last_wellness_screen_source && (
@@ -226,7 +337,7 @@ export default function Home() {
                       </div>
                     </div>
                     <div className="flex justify-between items-start">
-                      <span className="font-medium text-gray-900">Dental:</span>
+                      <span className="font-medium text-gray-900">Last dental exam:</span>
                       <div className="text-right">
                         <div className="text-sm text-gray-700">{data.faqs.last_dental_date || "Not specified"}</div>
                         {data.faqs.last_dental_source && (
@@ -237,7 +348,7 @@ export default function Home() {
                   </div>
                   <div className="space-y-3">
                     <div className="flex justify-between items-start">
-                      <span className="font-medium text-gray-900">DHPP:</span>
+                      <span className="font-medium text-gray-900">Last DHPP vaccine:</span>
                       <div className="text-right">
                         <div className="text-sm text-gray-700">{data.faqs.last_dhpp_date || "Not specified"}</div>
                         {data.faqs.last_dhpp_source && (
@@ -246,7 +357,7 @@ export default function Home() {
                       </div>
                     </div>
                     <div className="flex justify-between items-start">
-                      <span className="font-medium text-gray-900">Lepto:</span>
+                      <span className="font-medium text-gray-900">Last leptospirosis vaccine:</span>
                       <div className="text-right">
                         <div className="text-sm text-gray-700">{data.faqs.last_lepto_date || "Not specified"}</div>
                         {data.faqs.last_lepto_source && (
@@ -255,7 +366,7 @@ export default function Home() {
                       </div>
                     </div>
                     <div className="flex justify-between items-start">
-                      <span className="font-medium text-gray-900">Influenza:</span>
+                      <span className="font-medium text-gray-900">Last influenza vaccine:</span>
                       <div className="text-right">
                         <div className="text-sm text-gray-700">{data.faqs.last_influenza_date || "Not specified"}</div>
                         {data.faqs.last_influenza_source && (
@@ -264,7 +375,7 @@ export default function Home() {
                       </div>
                     </div>
                     <div className="flex justify-between items-start">
-                      <span className="font-medium text-gray-900">Flea/tick prevention:</span>
+                      <span className="font-medium text-gray-900">Last flea/tick prevention:</span>
                       <div className="text-right">
                         <div className="text-sm text-gray-700">{data.faqs.last_flea_tick_prevention_date || "Not specified"}</div>
                         {data.faqs.last_flea_tick_prevention_source && (
@@ -273,7 +384,7 @@ export default function Home() {
                       </div>
                     </div>
                     <div className="flex justify-between items-start">
-                      <span className="font-medium text-gray-900">Lyme:</span>
+                      <span className="font-medium text-gray-900">Last lyme disease vaccine:</span>
                       <div className="text-right">
                         <div className="text-sm text-gray-700">{data.faqs.last_lyme_date || "Not specified"}</div>
                         {data.faqs.last_lyme_source && (

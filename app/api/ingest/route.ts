@@ -1,232 +1,272 @@
-import { NextRequest, NextResponse } from "next/server";
-import OpenAI from "openai";
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { NextRequest, NextResponse } from 'next/server';
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
+// Initialize the Gemini API
+const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY!);
 
-type PdfjsTextItem = { str?: string } | Record<string, unknown>;
-interface PdfjsPage {
-  getTextContent(): Promise<{ items: PdfjsTextItem[] }>;
-}
-interface PdfjsDocument {
-  numPages: number;
-  getPage(n: number): Promise<PdfjsPage>;
-  destroy(): Promise<void> | void;
-}
+// Define the expected response structure
+type Vaccine = { vaccine: string; date: string | null; lot_or_notes: string | null; source: string };
+type Surgery = { procedure: string; date: string | null; outcome_or_notes: string | null; source: string };
+type Medication = { drug: string; dose: string | null; frequency: string | null; start_date: string | null; end_date: string | null; source: string };
+type Bloodwork = { panel: string; date: string | null; highlights: string[]; source: string };
 
-async function extractTextFromPdf(arrayBuffer: ArrayBuffer): Promise<string> {
+type Summary = {
+  faqs: {
+    last_rabies_vaccine_date: string | null;
+    last_rabies_vaccine_source: string | null;
+    last_fecal_exam_date: string | null;
+    last_fecal_exam_source: string | null;
+    last_heartworm_exam_or_treatment_date: string | null;
+    last_heartworm_exam_or_treatment_source: string | null;
+    last_wellness_screen_date: string | null;
+    last_wellness_screen_source: string | null;
+    last_dental_date: string | null;
+    last_dental_source: string | null;
+    last_dhpp_date: string | null;
+    last_dhpp_source: string | null;
+    last_lepto_date: string | null;
+    last_lepto_source: string | null;
+    last_influenza_date: string | null;
+    last_influenza_source: string | null;
+    last_flea_tick_prevention_date: string | null;
+    last_flea_tick_prevention_source: string | null;
+    last_lyme_date: string | null;
+    last_lyme_source: string | null;
+  };
+  vaccines: Vaccine[];
+  surgeries: Surgery[];
+  medications: Medication[];
+  bloodwork: Bloodwork[];
+};
+
+export async function POST(request: NextRequest) {
   try {
-    const pdfjsMod = await import("pdfjs-dist/legacy/build/pdf.mjs");
-    const pdfjs = pdfjsMod as unknown as {
-      getDocument: (src: { data: Uint8Array }) => { promise: Promise<PdfjsDocument> };
-    };
-    
-    const data = new Uint8Array(arrayBuffer);
-    const doc = await pdfjs.getDocument({ data }).promise;
-    let text = "";
-    
-    for (let pageNum = 1; pageNum <= doc.numPages; pageNum++) {
-      try {
-        const page = await doc.getPage(pageNum);
-        const content = await page.getTextContent();
-        const strings = content.items
-          .map((item: PdfjsTextItem) => {
-            if (typeof item === "object" && item && "str" in item && typeof (item as { str?: unknown }).str === "string") {
-              return (item as { str: string }).str;
-            }
-            return "";
-          })
-          .filter(Boolean);
-        text += strings.join(" ") + "\n";
-      } catch (pageError) {
-        console.warn(`Error processing page ${pageNum}:`, pageError);
-        // Continue with other pages even if one fails
-      }
-    }
-    
-    await doc.destroy();
-    return text.trim();
-  } catch (error) {
-    console.error("PDF extraction error:", error);
-    throw new Error(`Failed to extract text from PDF: ${error instanceof Error ? error.message : 'Unknown error'}`);
-  }
-}
-
-export async function POST(req: NextRequest) {
-  try {
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) {
-      return NextResponse.json({ error: "Missing OPENAI_API_KEY" }, { status: 500 });
-    }
-    const client = new OpenAI({ apiKey });
-
-    const contentType = req.headers.get("content-type") || "";
-    if (!contentType.includes("multipart/form-data")) {
-      return NextResponse.json({ error: "Expected multipart/form-data" }, { status: 400 });
+    // Check if API key is configured
+    if (!process.env.GOOGLE_API_KEY) {
+      return NextResponse.json(
+        { error: 'Google API key not configured' },
+        { status: 500 }
+      );
     }
 
-    const form = await req.formData();
-    const inputs = form.getAll("files");
-    const fileObjs = inputs.filter((f): f is File => f instanceof File);
+    const formData = await request.formData();
+    const files = formData.getAll('files') as File[];
 
-    const pdfFiles = fileObjs.filter((f) => {
-      const name = (f.name || "").toLowerCase();
-      const type = (f.type || "").toLowerCase();
-      return name.endsWith(".pdf") || type.includes("pdf");
-    });
-
-    if (pdfFiles.length === 0) {
-      return NextResponse.json({ error: "No PDF files uploaded" }, { status: 400 });
+    if (!files || files.length === 0) {
+      return NextResponse.json(
+        { error: 'No files provided' },
+        { status: 400 }
+      );
     }
 
-    const parsed = await Promise.all(
-      pdfFiles.map(async (file) => {
-        try {
-          const arrayBuffer = await file.arrayBuffer();
-          const text = await extractTextFromPdf(arrayBuffer);
-          return {
-            title: file.name || "attachment.pdf",
-            text,
-          };
-        } catch (error) {
-          console.error(`Error processing file ${file.name}:`, error);
-          return {
-            title: file.name || "attachment.pdf",
-            text: `[Error processing file: ${error instanceof Error ? error.message : 'Unknown error'}]`,
-          };
-        }
+    console.log(`Processing ${files.length} PDF files...`);
+
+    // Calculate total file size for debugging
+    const totalSize = files.reduce((sum, file) => sum + file.size, 0);
+    console.log(`Total file size: ${(totalSize / 1024 / 1024).toFixed(2)} MB`);
+
+    // Convert files to base64 for Gemini API - Gemini 1.5 Pro can handle large contexts
+    const fileData = await Promise.all(
+      files.map(async (file, index) => {
+        const bytes = await file.arrayBuffer();
+        const base64 = Buffer.from(bytes).toString('base64');
+        console.log(`File ${index + 1} (${file.name}): ${(base64.length / 1024).toFixed(2)} KB base64`);
+        return {
+          inlineData: {
+            data: base64,
+            mimeType: 'application/pdf'
+          }
+        };
       })
     );
 
-    const systemPrompt = `You are a clinical data abstractor for veterinary records. Read the provided documents and produce a concise, skimmable summary for a veterinarian.
-- Extract only objective, factual items explicitly present in the text. Do not infer.
-- Return dates in ISO format (YYYY-MM-DD) if present; otherwise null.
-- For each item, include the title of the source PDF where it was found as "source".
-- Keep strings short, suitable for thin cards.
-
-Required sections:
-1) faqs: Answers to frequently asked questions for a single patient.
-2) vaccines: list of prior vaccines.
-3) surgeries: list of prior surgeries/procedures.
-4) medications: list of prior prescribed medications.
-5) bloodwork: list of prior lab panels with notable values.
-`;
-
-    const combinedText = parsed
-      .map((p, i) => `--- DOCUMENT ${i + 1}: ${p.title} ---\n${p.text}`)
-      .join("\n\n");
-
-    const responseSchema = {
-      type: "object",
-      properties: {
-        faqs: {
-          type: "object",
-          properties: {
-            last_rabies_vaccine_date: { type: ["string", "null"] },
-            last_rabies_vaccine_source: { type: ["string", "null"] },
-            last_fecal_exam_date: { type: ["string", "null"] },
-            last_fecal_exam_source: { type: ["string", "null"] },
-            last_heartworm_exam_or_treatment_date: { type: ["string", "null"] },
-            last_heartworm_exam_or_treatment_source: { type: ["string", "null"] },
-            last_wellness_screen_date: { type: ["string", "null"] },
-            last_wellness_screen_source: { type: ["string", "null"] },
-            last_dental_date: { type: ["string", "null"] },
-            last_dental_source: { type: ["string", "null"] },
-            last_dhpp_date: { type: ["string", "null"] },
-            last_dhpp_source: { type: ["string", "null"] },
-            last_lepto_date: { type: ["string", "null"] },
-            last_lepto_source: { type: ["string", "null"] },
-            last_influenza_date: { type: ["string", "null"] },
-            last_influenza_source: { type: ["string", "null"] },
-            last_flea_tick_prevention_date: { type: ["string", "null"] },
-            last_flea_tick_prevention_source: { type: ["string", "null"] },
-            last_lyme_date: { type: ["string", "null"] },
-            last_lyme_source: { type: ["string", "null"] },
-          },
-          required: [],
-          additionalProperties: false,
-        },
-        vaccines: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              vaccine: { type: "string" },
-              date: { type: ["string", "null"] },
-              lot_or_notes: { type: ["string", "null"] },
-              source: { type: "string" },
-            },
-            required: ["vaccine", "source"],
-            additionalProperties: false,
-          },
-        },
-        surgeries: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              procedure: { type: "string" },
-              date: { type: ["string", "null"] },
-              outcome_or_notes: { type: ["string", "null"] },
-              source: { type: "string" },
-            },
-            required: ["procedure", "source"],
-            additionalProperties: false,
-          },
-        },
-        medications: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              drug: { type: "string" },
-              dose: { type: ["string", "null"] },
-              frequency: { type: ["string", "null"] },
-              start_date: { type: ["string", "null"] },
-              end_date: { type: ["string", "null"] },
-              source: { type: "string" },
-            },
-            required: ["drug", "source"],
-            additionalProperties: false,
-          },
-        },
-        bloodwork: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              panel: { type: "string" },
-              date: { type: ["string", "null"] },
-              highlights: { type: "array", items: { type: "string" } },
-              source: { type: "string" },
-            },
-            required: ["panel", "source"],
-            additionalProperties: false,
-          },
-        },
-      },
-      required: ["faqs", "vaccines", "surgeries", "medications", "bloodwork"],
-      additionalProperties: false,
-    } as const;
-
-    const completion = await client.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: combinedText },
-        { role: "user", content: "Return a JSON object strictly matching the provided JSON Schema. Use null when unknown." },
-      ],
-      response_format: { type: "json_schema", json_schema: { name: "VetSummary", schema: responseSchema, strict: false } },
-      temperature: 0,
+    // Try with Gemini 1.5 Pro first (best for large contexts)
+    let model = genAI.getGenerativeModel({ 
+      model: 'gemini-1.5-pro-latest',
+      generationConfig: {
+        temperature: 0.1,
+        maxOutputTokens: 8192,
+      }
     });
 
-    const raw = completion.choices[0]?.message?.content || "{}";
-    const json = JSON.parse(raw);
+    const prompt = `Please analyze these veterinary PDF records and extract the following information in JSON format:
 
-    return NextResponse.json(json);
-  } catch (error: unknown) {
-    console.error(error);
-    const message = error instanceof Error ? error.message : "Internal error";
-    return NextResponse.json({ error: message }, { status: 500 });
+{
+  "faqs": {
+    "last_rabies_vaccine_date": "YYYY-MM-DD or null",
+    "last_rabies_vaccine_source": "document name or null",
+    "last_fecal_exam_date": "YYYY-MM-DD or null", 
+    "last_fecal_exam_source": "document name or null",
+    "last_heartworm_exam_or_treatment_date": "YYYY-MM-DD or null",
+    "last_heartworm_exam_or_treatment_source": "document name or null",
+    "last_wellness_screen_date": "YYYY-MM-DD or null",
+    "last_wellness_screen_source": "document name or null",
+    "last_dental_date": "YYYY-MM-DD or null",
+    "last_dental_source": "document name or null",
+    "last_dhpp_date": "YYYY-MM-DD or null",
+    "last_dhpp_source": "document name or null",
+    "last_lepto_date": "YYYY-MM-DD or null",
+    "last_lepto_source": "document name or null",
+    "last_influenza_date": "YYYY-MM-DD or null",
+    "last_influenza_source": "document name or null",
+    "last_flea_tick_prevention_date": "YYYY-MM-DD or null",
+    "last_flea_tick_prevention_source": "document name or null",
+    "last_lyme_date": "YYYY-MM-DD or null",
+    "last_lyme_source": "document name or null"
+  },
+  "vaccines": [
+    {
+      "vaccine": "vaccine name",
+      "date": "YYYY-MM-DD or null",
+      "lot_or_notes": "lot number or notes or null",
+      "source": "document name"
+    }
+  ],
+  "surgeries": [
+    {
+      "procedure": "procedure name",
+      "date": "YYYY-MM-DD or null",
+      "outcome_or_notes": "outcome or notes or null",
+      "source": "document name"
+    }
+  ],
+  "medications": [
+    {
+      "drug": "medication name",
+      "dose": "dosage or null",
+      "frequency": "frequency or null",
+      "start_date": "YYYY-MM-DD or null",
+      "end_date": "YYYY-MM-DD or null",
+      "source": "document name"
+    }
+  ],
+  "bloodwork": [
+    {
+      "panel": "panel name",
+      "date": "YYYY-MM-DD or null",
+      "highlights": ["highlight1", "highlight2"],
+      "source": "document name"
+    }
+  ]
+}
+
+Instructions:
+- Use OCR to read all text from the PDF documents
+- Extract ALL veterinary information including vaccines, medications, procedures, lab work
+- For the "faqs" section, find the MOST RECENT date for each category across all documents
+- Use "Document 1", "Document 2", etc. as the "source" identifiers
+- Convert all dates to YYYY-MM-DD format (e.g., "12/15/2023" becomes "2023-12-15")
+- If a date cannot be determined, use null
+- Include all relevant medical information found in the documents
+- Return ONLY valid JSON, no additional text or formatting
+- Do not include markdown code blocks in your response
+
+Analyzing ${files.length} PDF document(s).`;
+
+    console.log('Attempting to generate content with Gemini 1.5 Pro...');
+
+    let result;
+    const modelFallbacks = [
+      'gemini-1.5-flash',     // Start with Flash - it's fast and supports PDFs
+      'gemini-1.5-pro',       // Then Pro for better quality
+      'gemini-1.5-flash-latest',
+      'gemini-1.5-pro-latest'
+    ];
+
+    let lastError;
+    for (const modelName of modelFallbacks) {
+      try {
+        console.log(`Trying model: ${modelName}`);
+        model = genAI.getGenerativeModel({ 
+          model: modelName,
+          generationConfig: {
+            temperature: 0.1,
+            maxOutputTokens: 8192,
+          }
+        });
+        
+        result = await model.generateContent([prompt, ...fileData]);
+        console.log(`Success with model: ${modelName}`);
+        break;
+      } catch (error: any) {
+        console.error(`Model ${modelName} failed:`, error.message);
+        lastError = error;
+        
+        // If it's not a rate limit error, don't try other models
+        if (!error.message.includes('RATE_LIMIT_EXCEEDED') && !error.message.includes('429')) {
+          console.log('Non-rate-limit error, stopping fallback attempts');
+          break;
+        }
+        continue;
+      }
+    }
+
+    if (!result) {
+      console.error('All models failed, throwing last error');
+      throw lastError;
+    }
+
+    const response = await result.response;
+    const text = response.text();
+
+    console.log('Content generated successfully');
+
+    // Parse the JSON response
+    let parsedData: Summary;
+    try {
+      // Clean up the response text (remove markdown formatting if present)
+      const cleanText = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      parsedData = JSON.parse(cleanText);
+    } catch (parseError) {
+      console.error('Failed to parse Gemini response:', text);
+      return NextResponse.json(
+        { error: 'Failed to parse AI response', details: text },
+        { status: 500 }
+      );
+    }
+
+    return NextResponse.json(parsedData);
+
+  } catch (error: any) {
+    console.error('Error processing files:', error);
+    
+    // Enhanced error handling with more specific messages
+    if (error?.message) {
+      if (error.message.includes('RATE_LIMIT_EXCEEDED') || error.message.includes('429')) {
+        return NextResponse.json(
+          { 
+            error: 'Rate limit exceeded', 
+            details: 'You need to enable billing in Google Cloud Console. Free tier has very low limits. Go to https://console.cloud.google.com/ and set up billing.' 
+          },
+          { status: 429 }
+        );
+      } else if (error.message.includes('API_KEY_INVALID')) {
+        return NextResponse.json(
+          { 
+            error: 'Invalid API key', 
+            details: 'Please check your GOOGLE_API_KEY in .env.local' 
+          },
+          { status: 401 }
+        );
+      } else if (error.message.includes('PERMISSION_DENIED')) {
+        return NextResponse.json(
+          { 
+            error: 'Permission denied', 
+            details: 'Enable the Generative Language API in Google Cloud Console' 
+          },
+          { status: 403 }
+        );
+      }
+      
+      return NextResponse.json(
+        { error: 'Processing failed', details: error.message },
+        { status: 500 }
+      );
+    }
+    
+    return NextResponse.json(
+      { error: 'Unknown error occurred' },
+      { status: 500 }
+    );
   }
 } 
