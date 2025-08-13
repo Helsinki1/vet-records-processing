@@ -188,12 +188,13 @@ Analyzing ${files.length} PDF document(s).`;
         result = await model.generateContent([prompt, ...fileData]);
         console.log(`Success with model: ${modelName}`);
         break;
-      } catch (error: any) {
-        console.error(`Model ${modelName} failed:`, error.message);
+      } catch (error: unknown) {
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        console.error(`Model ${modelName} failed:`, errorMessage);
         lastError = error;
         
         // If it's not a rate limit error, don't try other models
-        if (!error.message.includes('RATE_LIMIT_EXCEEDED') && !error.message.includes('429')) {
+        if (!errorMessage.includes('RATE_LIMIT_EXCEEDED') && !errorMessage.includes('429')) {
           console.log('Non-rate-limit error, stopping fallback attempts');
           break;
         }
@@ -217,7 +218,7 @@ Analyzing ${files.length} PDF document(s).`;
       // Clean up the response text (remove markdown formatting if present)
       const cleanText = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
       parsedData = JSON.parse(cleanText);
-    } catch (parseError) {
+    } catch {
       console.error('Failed to parse Gemini response:', text);
       return NextResponse.json(
         { error: 'Failed to parse AI response', details: text },
@@ -227,12 +228,13 @@ Analyzing ${files.length} PDF document(s).`;
 
     return NextResponse.json(parsedData);
 
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error('Error processing files:', error);
     
     // Enhanced error handling with more specific messages
-    if (error?.message) {
-      if (error.message.includes('RATE_LIMIT_EXCEEDED') || error.message.includes('429')) {
+    const errorMessage = error instanceof Error ? error.message : '';
+    if (errorMessage) {
+      if (errorMessage.includes('RATE_LIMIT_EXCEEDED') || errorMessage.includes('429')) {
         return NextResponse.json(
           { 
             error: 'Rate limit exceeded', 
@@ -240,7 +242,7 @@ Analyzing ${files.length} PDF document(s).`;
           },
           { status: 429 }
         );
-      } else if (error.message.includes('API_KEY_INVALID')) {
+      } else if (errorMessage.includes('API_KEY_INVALID')) {
         return NextResponse.json(
           { 
             error: 'Invalid API key', 
@@ -248,7 +250,7 @@ Analyzing ${files.length} PDF document(s).`;
           },
           { status: 401 }
         );
-      } else if (error.message.includes('PERMISSION_DENIED')) {
+      } else if (errorMessage.includes('PERMISSION_DENIED')) {
         return NextResponse.json(
           { 
             error: 'Permission denied', 
@@ -259,7 +261,7 @@ Analyzing ${files.length} PDF document(s).`;
       }
       
       return NextResponse.json(
-        { error: 'Processing failed', details: error.message },
+        { error: 'Processing failed', details: errorMessage },
         { status: 500 }
       );
     }

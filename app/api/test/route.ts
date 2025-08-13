@@ -1,5 +1,5 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import { NextRequest, NextResponse } from 'next/server';
+import { NextResponse } from 'next/server';
 
 const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY!);
 
@@ -27,12 +27,13 @@ export async function GET() {
       modelUsed: 'gemini-pro'
     });
 
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error('API test failed:', error);
     
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     return NextResponse.json({
       success: false,
-      error: error.message,
+      error: errorMessage,
       details: 'Check console for full error details'
     }, { status: 500 });
   }
